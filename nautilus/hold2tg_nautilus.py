@@ -8,7 +8,8 @@ python3-nautilus. It does two things:
    hold2tg daemon knows what to send when the hotkey is held.
 2. Adds a "Send to Telegram" entry to the right-click menu.
 
-Works with both extension APIs: Nautilus 43+ (GTK 4) and older (GTK 3).
+Works with every extension API: 4.1 (Nautilus 49+), 4.0 (Nautilus 43+, both
+GTK 4) and 3.0 (older, GTK 3).
 Everything is wrapped defensively: an error here must never break Nautilus.
 """
 import json
@@ -19,12 +20,17 @@ import time
 
 import gi
 
-try:
-    gi.require_version("Nautilus", "4.0")
-    gi.require_version("Gtk", "4.0")
-except ValueError:
-    gi.require_version("Nautilus", "3.0")
-    gi.require_version("Gtk", "3.0")
+# Nautilus 49+ ships the 4.1 API (same menu/file calls as 4.0), 43-48 ship
+# 4.0, and older releases 3.0 with GTK 3.
+for _nautilus, _gtk in (("4.1", "4.0"), ("4.0", "4.0"), ("3.0", "3.0")):
+    try:
+        gi.require_version("Nautilus", _nautilus)
+        gi.require_version("Gtk", _gtk)
+        break
+    except ValueError:
+        continue
+else:
+    raise ImportError("no supported Nautilus extension API (python3-nautilus)")
 
 from gi.repository import GLib, GObject, Gtk, Nautilus  # noqa: E402
 
@@ -130,7 +136,7 @@ class Hold2TgExtension(GObject.GObject, Nautilus.MenuProvider):
             return []
         item = Nautilus.MenuItem(
             name="Hold2Tg::send",
-            label="ارسال به تلگرام",
+            label="Send To Telegram",
             tip="Send the selected items to the Telegram channel (hold2tg)")
         item.connect("activate", self._on_send, paths)
         return [item]

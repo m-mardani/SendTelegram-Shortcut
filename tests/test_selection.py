@@ -98,7 +98,8 @@ class RealXSelectionTests(unittest.TestCase):
             for text in ("plain", "متن فارسی با ایموجی 🙂\nخط دوم\n"):
                 self.own_primary(text)
                 self.assertEqual(selection.read_primary_text(), text)
-                self.assertEqual(selection.read_primary_text("xsel"), text)
+                if shutil.which("xsel"):  # optional; install.sh only installs xclip
+                    self.assertEqual(selection.read_primary_text("xsel"), text)
 
     def test_capture_end_to_end(self):
         self.own_primary("from the real selection")
