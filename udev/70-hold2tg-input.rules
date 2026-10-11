@@ -1,0 +1,4 @@
+# hold2tg: let the user of the active local session read keyboard events, so
+# the hold-to-send hotkey can be detected (works on both X11 and Wayland).
+# Must be numbered below 73 (73-seat-late.rules applies the "uaccess" tag).
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"
