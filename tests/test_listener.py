@@ -11,7 +11,7 @@ from hold2tg.config import Config  # noqa: E402
 from hold2tg.notify import Notifier  # noqa: E402
 from hold2tg.selection import Snapshot  # noqa: E402
 
-CTRL, SHIFT, S, A = 29, 42, 31, 30
+CTRL, SHIFT, ALT, S, A, V, T, H = 29, 42, 56, 31, 30, 47, 20, 35
 HOLD = 0.4
 
 
@@ -26,7 +26,58 @@ class RecordingSender:
         return True
 
 
-class ListenerTests(unittest.TestCase):
+class RecordingFetcher:
+    def __init__(self):
+        self.fetched = 0
+        self.synced = 0
+        self.event = threading.Event()
+
+    def fetch(self):
+        self.fetched += 1
+        self.event.set()
+        return True
+
+    def sync(self):
+        self.synced += 1
+
+
+class RecordingTranslator:
+    def __init__(self):
+        self.shown = []
+        self.event = threading.Event()
+
+    def show(self, text):
+        self.shown.append(text)
+        self.event.set()
+
+
+class RecordingHistoryBox:
+    def __init__(self):
+        self.toggled = []
+        self.event = threading.Event()
+
+    def toggle(self):
+        self.toggled.append(time.monotonic())
+        self.event.set()
+
+
+class RecordingRecorder:
+    def __init__(self):
+        self.checks = 0
+        self.stopped = False
+
+    def check(self, now):
+        self.checks += 1
+
+    def stop(self):
+        self.stopped = True
+
+
+class _ListenerCase(unittest.TestCase):
+    FETCH = ""      # the fetch, translate and history hotkeys are off
+    TRANSLATE = ""  # unless a test case turns them on
+    HISTORY = ""
+
     def setUp(self):
         fake_evdev.registry.clear()
         self.kbd = fake_evdev.FakeKeyboard("/dev/input/event3", range(1, 120), "AT keyboard")
@@ -42,6 +93,8 @@ class ListenerTests(unittest.TestCase):
             mock.patch.object(listener_mod.glob, "glob",
                               side_effect=lambda _p: sorted(fake_evdev.registry)),
             mock.patch.object(listener_mod.selection, "capture", side_effect=capture),
+            mock.patch.object(listener_mod.selection, "read_primary_text",
+                              side_effect=lambda backend="auto": self.highlighted.pop(0)),
             mock.patch.object(listener_mod, "RESCAN_SECONDS", 0.2),
             # the daemon imports evdev lazily; hand it the simulated one
             mock.patch.dict(sys.modules, {"evdev": fake_evdev}),
@@ -50,9 +103,19 @@ class ListenerTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.sender = RecordingSender()
-        cfg = Config(hold_seconds=HOLD, notifications=False)
-        self.listener = listener_mod.Listener(cfg, self.sender, Notifier(False))
+        self.fetcher = RecordingFetcher()
+        self.translator = RecordingTranslator()
+        self.highlighted = []
+        self.history_box = RecordingHistoryBox()
+        self.recorder = RecordingRecorder()
+        cfg = Config(hotkey="ctrl+shift+s", hold_seconds=HOLD, notifications=False,
+                     fetch_hotkey=self.FETCH, fetch_hold_seconds=HOLD,
+                     translate_hotkey=self.TRANSLATE, translate_hold_seconds=HOLD,
+                     history_hotkey=self.HISTORY, history_hold_seconds=0)
+        self.listener = listener_mod.Listener(cfg, self.sender, Notifier(False), self.fetcher,
+                                              self.translator, self.history_box, self.recorder)
         thread = threading.Thread(target=self.listener.run, daemon=True)
+        self.thread = thread
         thread.start()
         self.addCleanup(thread.join, 2)
         self.addCleanup(self.listener.stop)
@@ -60,6 +123,9 @@ class ListenerTests(unittest.TestCase):
         while "/dev/input/event3" not in self.listener.devices and time.monotonic() < deadline:
             time.sleep(0.01)
 
+
+
+class ListenerTests(_ListenerCase):
     def test_only_real_readable_keyboards_are_used(self):
         self.assertEqual(list(self.listener.devices), ["/dev/input/event3"])
         self.assertEqual(self.listener.rejected, {"/dev/input/event0"})
@@ -118,6 +184,94 @@ class ListenerTests(unittest.TestCase):
         self.kbd.down.clear()
         self.kbd.emit(fake_evdev.EV_SYN, fake_evdev.SYN_DROPPED, 0)
         self.assertFalse(self.sender.event.wait(HOLD * 2))
+
+
+class FetchHotkeyTests(_ListenerCase):
+    FETCH = "ctrl+alt+v"
+
+    def test_fetch_needs_the_full_hold_and_fires_once_per_hold(self):
+        self.kbd.press(CTRL, ALT, V)
+        time.sleep(HOLD / 2)
+        self.kbd.release(V)
+        self.assertFalse(self.fetcher.event.wait(HOLD * 2))   # let go too early
+        self.kbd.release(ALT, CTRL)
+        t0 = time.monotonic()
+        self.kbd.press(CTRL, ALT, V)
+        self.assertTrue(self.fetcher.event.wait(3), "nothing was fetched")
+        self.assertGreaterEqual(time.monotonic() - t0, HOLD)
+        time.sleep(HOLD * 2)                                  # keep holding: no repeat
+        self.kbd.release(V, ALT, CTRL)
+        self.assertEqual(self.fetcher.fetched, 1)
+        self.assertEqual(self.sender.sent, [])
+
+    def test_send_hotkey_still_works_and_the_channel_is_checked_at_start(self):
+        self.kbd.press(CTRL, SHIFT, S)
+        self.assertTrue(self.sender.event.wait(3))
+        self.assertEqual(self.fetcher.fetched, 0)
+        self.assertGreaterEqual(self.fetcher.synced, 1)
+
+    def test_without_a_fetch_hotkey_the_channel_is_left_alone(self):
+        self.listener.stop()
+        cfg = Config(hotkey="ctrl+shift+s", fetch_hotkey="", notifications=False)
+        listener = listener_mod.Listener(cfg, self.sender, Notifier(False), RecordingFetcher())
+        self.assertIsNone(listener.fetcher)
+        self.assertEqual(len(listener.hotkeys), 1)
+
+
+class TranslateHotkeyTests(_ListenerCase):
+    TRANSLATE = "ctrl+alt+t"
+
+    def test_text_highlighted_at_press_time_is_translated_after_the_hold(self):
+        self.highlighted = ["hello at press time", "something else later"]
+        t0 = time.monotonic()
+        self.kbd.press(CTRL, ALT, T)
+        self.assertTrue(self.translator.event.wait(3), "no translation box")
+        self.assertGreaterEqual(time.monotonic() - t0, HOLD)
+        self.kbd.release(T, ALT, CTRL)
+        self.assertEqual(self.translator.shown, ["hello at press time"])
+        self.assertEqual(self.sender.sent, [])
+
+    def test_short_press_opens_nothing(self):
+        self.highlighted = ["x"]
+        self.kbd.press(CTRL, ALT, T)
+        time.sleep(HOLD / 2)
+        self.kbd.release(T)
+        self.assertFalse(self.translator.event.wait(HOLD * 2))
+
+
+class HistoryHotkeyTests(_ListenerCase):
+    HISTORY = "ctrl+alt+h"
+
+    def test_a_press_opens_the_history_at_once_and_only_once(self):
+        t0 = time.monotonic()
+        self.kbd.press(CTRL, ALT, H)
+        self.assertTrue(self.history_box.event.wait(3), "no history box")
+        self.assertLess(self.history_box.toggled[0] - t0, 0.2)   # no holding needed
+        time.sleep(0.3)                                           # held on: still once
+        self.kbd.release(H, ALT, CTRL)
+        self.assertEqual(len(self.history_box.toggled), 1)
+        self.history_box.event.clear()
+        self.kbd.press(CTRL, ALT, H)                              # again: toggles again
+        self.assertTrue(self.history_box.event.wait(3))
+        self.kbd.release(H, ALT, CTRL)
+        self.assertEqual(len(self.history_box.toggled), 2)
+        self.assertEqual(self.sender.sent, [])
+
+    def test_the_recorder_runs_with_the_daemon(self):
+        deadline = time.monotonic() + 2
+        while not self.recorder.checks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(self.recorder.checks, 1)
+        self.listener.stop()
+        self.thread.join(2)
+        self.assertTrue(self.recorder.stopped)
+
+    def test_turned_off_there_is_no_hotkey_and_nothing_is_recorded(self):
+        cfg = Config(hotkey="ctrl+shift+s", history_hotkey="", notifications=False)
+        listener = listener_mod.Listener(cfg, self.sender, Notifier(False), None, None,
+                                         RecordingHistoryBox(), RecordingRecorder())
+        self.assertEqual([h.name for h in listener.hotkeys], ["send"])
+        self.assertIsNone(listener.recorder)
 
 
 if __name__ == "__main__":

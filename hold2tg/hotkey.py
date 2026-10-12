@@ -16,8 +16,12 @@ MODIFIERS: Dict[str, FrozenSet[int]] = {
     "shift": frozenset({42, 54}),     # KEY_LEFTSHIFT, KEY_RIGHTSHIFT
     "alt": frozenset({56, 100}),      # KEY_LEFTALT, KEY_RIGHTALT
     "super": frozenset({125, 126}),   # KEY_LEFTMETA, KEY_RIGHTMETA
+    # Not a modifier to the kernel; hold2tg holds it like one. On GNOME the
+    # caps:hyper keyboard option makes it one for the apps (see gnome.py).
+    "capslock": frozenset({58}),      # KEY_CAPSLOCK
 }
-MODIFIER_ALIASES = {"control": "ctrl", "meta": "super", "win": "super", "cmd": "super"}
+MODIFIER_ALIASES = {"control": "ctrl", "meta": "super", "win": "super", "cmd": "super",
+                    "caps": "capslock"}
 
 KEYS: Dict[str, int] = {}
 for _row, _start in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
@@ -86,6 +90,13 @@ def parse_combo(text: str) -> Combo:
     if len(set(groups)) != len(groups):
         raise HotkeyError("duplicate key in hotkey %r" % text)
     return Combo(groups, "+".join(parts))
+
+
+def describe(combo: Combo, hold_seconds: float) -> str:
+    """How to trigger a hotkey, for logs: "press …" or "hold … for N seconds"."""
+    if not hold_seconds:
+        return "press %s" % combo.label
+    return "hold %s for %g seconds" % (combo.label, hold_seconds)
 
 
 # --- hold detection ----------------------------------------------------------

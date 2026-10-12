@@ -1,11 +1,11 @@
-"""Minimal Telegram Bot API client (sendMessage / sendDocument)."""
+"""Minimal Telegram Bot API client (sending, getUpdates and file downloads)."""
 from __future__ import annotations
 
 import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 log = logging.getLogger("hold2tg.telegram")
 
@@ -125,6 +125,9 @@ class TelegramClient:
         self.session = requests.Session()
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
+        # Called with every Message this client posts (bots never receive
+        # updates about their own posts, so this is how they get recorded).
+        self.on_sent: Optional[Callable[[Dict[str, Any]], None]] = None
 
     # -- plumbing --
     def _scrub(self, text: Any) -> str:
@@ -148,8 +151,8 @@ class TelegramClient:
                     resp = self.session.post(url, data=data or {}, timeout=(15, timeout))
             except self._requests.RequestException as e:
                 last = "network error: %s" % self._scrub(e)
-                log.warning("%s (attempt %d/%d)", last, attempt, self.retries)
-                if attempt < self.retries:
+                if attempt < self.retries:  # the last failure is the caller's to report
+                    log.warning("%s (attempt %d/%d)", last, attempt, self.retries)
                     time.sleep(min(2 ** attempt, self.max_wait))
                 continue
             finally:
@@ -176,6 +179,13 @@ class TelegramClient:
             raise TelegramError(last, code)
         raise TelegramError(last)
 
+    def _sent(self, message: Any) -> None:
+        if self.on_sent is not None and isinstance(message, dict):
+            try:
+                self.on_sent(message)
+            except Exception:  # recording must never fail a send
+                log.warning("could not record the sent message", exc_info=True)
+
     # -- API --
     def get_me(self) -> Dict[str, Any]:
         return self._call("getMe")
@@ -183,24 +193,56 @@ class TelegramClient:
     def get_chat(self) -> Dict[str, Any]:
         return self._call("getChat", {"chat_id": self.chat_id})
 
-    def get_updates(self) -> List[Dict[str, Any]]:
-        return self._call("getUpdates", {"timeout": 0, "limit": 100})
+    def get_updates(self, offset: int = 0) -> List[Dict[str, Any]]:
+        """Pending updates. A non-zero ``offset`` confirms (drops) the older ones."""
+        data: Dict[str, Any] = {"timeout": 0, "limit": 100}
+        if offset:
+            data["offset"] = offset
+        return self._call("getUpdates", data)
 
     def send_text(self, text: str) -> int:
         """Send text (split into several messages if long). Returns the count."""
         chunks = split_text(text)
         for chunk in chunks:
-            self._call("sendMessage", {
+            self._sent(self._call("sendMessage", {
                 "chat_id": self.chat_id,
                 "text": chunk,
                 "disable_notification": "true" if self.silent else "false",
-            })
+            }))
         return len(chunks)
 
     def send_document(self, path: str, filename: str = "") -> None:
-        self._call(
+        self._sent(self._call(
             "sendDocument",
             {"chat_id": self.chat_id,
              "disable_notification": "true" if self.silent else "false"},
             upload={"field": "document", "path": path,
-                    "filename": filename or os.path.basename(path)})
+                    "filename": filename or os.path.basename(path)}))
+
+    def download(self, file_id: str, dest: str) -> None:
+        """Download a file the bot can see to ``dest`` (written atomically).
+        The official Bot API serves files of up to 20 MB only."""
+        info = self._call("getFile", {"file_id": file_id})
+        url = "%s/file/bot%s/%s" % (self.api_base, self.token, info["file_path"])
+        part = dest + ".part"
+        last = "unknown error"
+        for attempt in range(1, self.retries + 1):
+            try:
+                with self.session.get(url, stream=True, timeout=(15, 120)) as resp:
+                    if resp.status_code != 200:
+                        raise TelegramError("download failed: HTTP %d" % resp.status_code,
+                                            resp.status_code)
+                    with open(part, "wb") as fh:
+                        for chunk in resp.iter_content(256 * 1024):
+                            fh.write(chunk)
+                os.replace(part, dest)
+                return
+            except self._requests.RequestException as e:
+                last = "network error: %s" % self._scrub(e)
+                if attempt < self.retries:
+                    log.warning("%s (attempt %d/%d)", last, attempt, self.retries)
+                    time.sleep(min(2 ** attempt, self.max_wait))
+            finally:
+                if os.path.exists(part):
+                    os.remove(part)
+        raise TelegramError(last)

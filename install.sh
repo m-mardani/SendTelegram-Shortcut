@@ -14,6 +14,9 @@ BIN_DIR="$HOME/.local/bin"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hold2tg"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 EXT_DIR="$HOME/.local/share/nautilus-python/extensions"
+SHELL_EXT_UUID=hold2tg-clipboard@m-mardani.github.io
+SHELL_EXT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$SHELL_EXT_UUID"
+RELOGIN=0
 RULE=/etc/udev/rules.d/70-hold2tg-input.rules
 PY=/usr/bin/python3
 
@@ -39,6 +42,10 @@ fi
 if [ "$SYSTEM" -eq 1 ]; then
   step "Installing system packages (sudo)"
   PKGS="python3 python3-evdev python3-requests python3-socks xclip wl-clipboard libnotify-bin"
+  # gsettings, gdbus and glib-compile-schemas: the GNOME Shell extension and Caps Lock hotkeys.
+  PKGS="$PKGS libglib2.0-bin"
+  # The translation box (GTK 4 + libadwaita).
+  PKGS="$PKGS python3-gi gir1.2-gtk-4.0 gir1.2-adw-1"
   # The Nautilus extension needs python3-nautilus; only where Nautilus exists.
   if command -v nautilus >/dev/null 2>&1; then PKGS="$PKGS python3-nautilus"; fi
   # shellcheck disable=SC2086
@@ -90,6 +97,41 @@ if [ "$SYSTEM" -eq 1 ]; then
   fi
 fi
 
+step "Installing the clipboard history (GNOME Shell extension)"
+SHELL_MAJOR=$(gnome-shell --version 2>/dev/null | grep -oE '[0-9]+' | head -1)
+if [ -z "$SHELL_MAJOR" ]; then
+  note "GNOME Shell not found: hold2tg's own clipboard history box is used"
+elif [ "$SHELL_MAJOR" -lt 48 ]; then
+  note "GNOME $SHELL_MAJOR is older than the extension needs (48): hold2tg's own box is used"
+elif ! command -v glib-compile-schemas >/dev/null 2>&1 || ! command -v gsettings >/dev/null 2>&1; then
+  warn "glib-compile-schemas/gsettings missing (sudo apt install libglib2.0-bin): extension skipped"
+else
+  rm -rf "$SHELL_EXT_DIR"
+  mkdir -p "$(dirname "$SHELL_EXT_DIR")"
+  cp -r "$SRC/gnome-shell/$SHELL_EXT_UUID" "$SHELL_EXT_DIR"
+  glib-compile-schemas "$SHELL_EXT_DIR/schemas"
+  if gnome-extensions info "$SHELL_EXT_UUID" 2>/dev/null | grep -q "State: ACTIVE"; then
+    note "installed; it is running already (an update takes effect at your next login)"
+  else
+    # A running shell only finds a new extension when it starts: enable it for the next login.
+    $PY - "$SHELL_EXT_UUID" <<'PY'
+import ast, subprocess, sys
+uuid = sys.argv[1]
+raw = subprocess.run(["gsettings", "get", "org.gnome.shell", "enabled-extensions"],
+                     stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
+items = [] if raw.startswith("@as") or not raw else list(ast.literal_eval(raw))
+if uuid not in items:
+    subprocess.run(["gsettings", "set", "org.gnome.shell", "enabled-extensions",
+                    str(items + [uuid])], check=True)
+PY
+    RELOGIN=1
+    note "installed and enabled for your next login (until then hold2tg's own box is used)"
+  fi
+  if [ "$(gsettings get org.gnome.shell disable-user-extensions 2>/dev/null)" = "true" ]; then
+    warn "extensions are turned off in GNOME (Extensions app → Extensions switch)"
+  fi
+fi
+
 step "Starting the background service"
 cp "$SRC/systemd/hold2tg.service" "$UNIT_DIR/hold2tg.service"
 if systemctl --user daemon-reload 2>/dev/null; then
@@ -116,9 +158,20 @@ cat <<DONE
 
 Installed. What is left:
   1. Put your bot token and channel in:  $CONF_DIR/config.ini
-  2. hold2tg test      # sends a test message to the channel
-  3. hold2tg doctor    # checks everything
-  4. systemctl --user restart hold2tg    # after changing the config
+  2. systemctl --user restart hold2tg    # after every config change
+  3. hold2tg test      # sends a test message to the channel
+  4. hold2tg doctor    # checks everything
 
-Then select files in Files, or highlight text anywhere, and hold the hotkey.
+The hotkeys (defaults; change them in the config):
+  hold Caps Lock + C  (5 s)   send the selected files or highlighted text to Telegram
+  hold Caps Lock + V  (5 s)   copy the channel's newest message to the clipboard
+  hold Caps Lock + T  (5 s)   translate the highlighted text
+  press Caps Lock + H         the clipboard history
+
+Caps Lock now works as the hotkeys' modifier and no longer turns on capitals
+(Shift still does). Pick other hotkeys in the config to get it back.
 DONE
+if [ "$RELOGIN" -eq 1 ]; then
+  warn "Log out and back in once, so GNOME starts hold2tg's extension: until then the Caps Lock"
+  warn "hotkeys also reach the app you are in, and the clipboard history is the slower box."
+fi

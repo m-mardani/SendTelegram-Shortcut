@@ -1,0 +1,8 @@
+{
+  "uuid": "hold2tg-clipboard@m-mardani.github.io",
+  "name": "hold2tg clipboard history",
+  "description": "A clipboard history like Windows' Win+V (Caps Lock+H with hold2tg): the texts and pictures you copied lately; pick one to paste it. It also keeps hold2tg's Caps Lock hotkeys from the apps. Part of hold2tg.",
+  "shell-version": ["48", "49", "50"],
+  "settings-schema": "org.gnome.shell.extensions.hold2tg-clipboard",
+  "version-name": "1.0"
+}

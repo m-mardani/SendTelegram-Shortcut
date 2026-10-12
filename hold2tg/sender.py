@@ -10,6 +10,7 @@ import zipfile
 from typing import List, Tuple
 
 from .config import Config, ConfigError
+from .inbox import Inbox
 from .notify import Notifier
 from .selection import Snapshot
 from .telegram import TelegramClient, TelegramError
@@ -38,8 +39,11 @@ class Sender:
 
     def _client(self) -> TelegramClient:
         self.cfg.require_telegram()
-        return TelegramClient(self.cfg.bot_token, self.cfg.chat_id, self.cfg.api_base,
-                              self.cfg.proxy, self.cfg.silent)
+        client = TelegramClient(self.cfg.bot_token, self.cfg.chat_id, self.cfg.api_base,
+                                self.cfg.proxy, self.cfg.silent)
+        # What we post is part of "the newest message" the fetch hotkey copies.
+        client.on_sent = Inbox(self.cfg.bot_token, self.cfg.chat_id).record
+        return client
 
     def send(self, snap: Snapshot) -> bool:
         """Send a snapshot; reports the outcome to the user. True on full success."""

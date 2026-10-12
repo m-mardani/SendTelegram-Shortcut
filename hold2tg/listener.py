@@ -1,4 +1,7 @@
-"""The background daemon: watches keyboards through evdev and fires the send.
+"""The background daemon: watches keyboards through evdev and fires the
+hotkeys: send, fetch (copies the channel's newest message to the clipboard),
+translate (opens the translation box) and history (shows the texts copied
+lately). It also keeps the clipboard recorder running for the history.
 
 evdev reads raw key events from /dev/input, so it works the same on X11 and
 Wayland and independently of the active keyboard layout. It only *listens*:
@@ -13,39 +16,76 @@ import os
 import select
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Dict, Optional, Set
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from . import config as config_mod
 from . import selection
 from .config import Config
-from .hotkey import HoldDetector
+from .fetcher import Fetcher
+from .history import HistoryBox, Recorder
+from .hotkey import HoldDetector, describe
 from .notify import Notifier
 from .sender import Sender
+from .translate import Popup
 
 log = logging.getLogger("hold2tg.listener")
 
 RESCAN_SECONDS = 5.0
+SYNC_SECONDS = 600.0  # collect channel posts well within Telegram's 24-hour window
 
 
 class AlreadyRunning(Exception):
     pass
 
 
+@dataclass
+class Hotkey:
+    name: str
+    detector: HoldDetector
+    action: Callable[[Any], Any]            # gets what `capture` returned
+    failed: str                             # message key shown if the action crashes
+    capture: Optional[Callable[[], Any]] = None  # runs the moment the combo goes down
+    pending: Optional[Future] = None
+
+
 class Listener:
-    def __init__(self, cfg: Config, sender: Sender, notifier: Notifier):
+    def __init__(self, cfg: Config, sender: Sender, notifier: Notifier,
+                 fetcher: Optional[Fetcher] = None, translator: Optional[Popup] = None,
+                 history_box: Optional[HistoryBox] = None, recorder: Optional[Recorder] = None):
         import evdev  # lazy: only the daemon needs it
 
         self.evdev = evdev
         self.cfg = cfg
-        self.sender = sender
         self.notifier = notifier
-        self.combo = cfg.combo
-        self.detector = HoldDetector(self.combo, cfg.hold_seconds)
+        backend = cfg.text_backend
+        self.hotkeys: List[Hotkey] = [Hotkey(
+            "send", HoldDetector(cfg.combo, cfg.hold_seconds), sender.send, "failed",
+            # Snapshot the selection the instant the combo goes down — before
+            # the focused app reacts to the keys (a "Save As" dialog would
+            # otherwise steal the focus and sometimes the selection).
+            capture=lambda: selection.capture(backend))]
+        self.fetcher = fetcher if cfg.fetch_combo is not None else None
+        if self.fetcher is not None:
+            self.hotkeys.append(Hotkey(
+                "fetch", HoldDetector(cfg.fetch_combo, cfg.fetch_hold_seconds),
+                lambda _: fetcher.fetch(), "fetch_failed"))
+        if translator is not None and cfg.translate_combo is not None:
+            self.hotkeys.append(Hotkey(
+                "translate", HoldDetector(cfg.translate_combo, cfg.translate_hold_seconds),
+                translator.show, "translate_failed",
+                capture=lambda: selection.read_primary_text(backend)))
+        self.recorder = None
+        if history_box is not None and cfg.history_combo is not None:
+            self.hotkeys.append(Hotkey(
+                "history", HoldDetector(cfg.history_combo, cfg.history_hold_seconds),
+                lambda _: history_box.toggle(), "history_failed"))
+            self.recorder = recorder
+        self.codes = frozenset().union(*(h.detector.combo.all_codes for h in self.hotkeys))
         self.devices: Dict[str, "evdev.InputDevice"] = {}
         self.rejected: Set[str] = set()   # opened fine, but not a keyboard
         self.denied: Set[str] = set()     # no permission (yet)
-        self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hold2tg")
-        self.pending: Optional[Future] = None
+        self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hold2tg")
         self._warned_no_keyboard = False
         self._lock_fh = None
         self.running = True
@@ -76,12 +116,13 @@ class Listener:
             self.denied.discard(path)
             try:
                 keys = set(dev.capabilities().get(self.evdev.ecodes.EV_KEY, []))
-                if not keys & self.combo.all_codes:
+                if not keys & self.codes:
                     dev.close()
                     self.rejected.add(path)
                     continue
                 self.devices[path] = dev
-                self._handle(self.detector.sync_device(path, dev.active_keys(), now))
+                active = dev.active_keys()
+                self._feed(lambda d: d.sync_device(path, active, now))
                 log.info("listening on %s (%s)", path, dev.name)
             except OSError:
                 self._drop(path)
@@ -103,49 +144,71 @@ class Listener:
                 dev.close()
             except OSError:
                 pass
-        self._handle(self.detector.drop_device(path, time.monotonic()))
+        now = time.monotonic()
+        self._feed(lambda d: d.drop_device(path, now))
 
-    # -- signals from the detector --
-    def _handle(self, signal: Optional[str]) -> None:
+    # -- signals from the detectors --
+    def _feed(self, step: Callable[[HoldDetector], Optional[str]]) -> None:
+        for hotkey in self.hotkeys:
+            self._handle(hotkey, step(hotkey.detector))
+
+    def _handle(self, hotkey: Hotkey, signal: Optional[str]) -> None:
         if signal == "arm":
-            # Snapshot the selection the instant the combo goes down — before
-            # the focused app reacts to the keys (a "Save As" dialog would
-            # otherwise steal the focus and sometimes the selection).
-            log.debug("armed")
-            self.pending = self.pool.submit(selection.capture, self.cfg.text_backend)
+            log.debug("%s armed", hotkey.name)
+            if hotkey.capture is not None:
+                hotkey.pending = self.pool.submit(hotkey.capture)
         elif signal == "cancel":
-            log.debug("cancelled")
-            self.pending = None
+            log.debug("%s cancelled", hotkey.name)
+            hotkey.pending = None
         elif signal == "fire":
-            pending, self.pending = self.pending, None
-            log.info("hotkey held for %gs — sending", self.cfg.hold_seconds)
-            self.pool.submit(self._send, pending)
+            pending, hotkey.pending = hotkey.pending, None
+            log.info("%s hotkey held for %gs", hotkey.name, hotkey.detector.hold_seconds)
+            self.pool.submit(self._run, hotkey, pending)
 
-    def _send(self, pending: Optional[Future]) -> None:
+    def _run(self, hotkey: Hotkey, pending: Optional[Future]) -> None:
         try:
-            snap = pending.result(timeout=10) if pending is not None else selection.capture(
-                self.cfg.text_backend)
-            self.sender.send(snap)
+            if pending is not None:
+                captured = pending.result(timeout=10)
+            else:
+                captured = hotkey.capture() if hotkey.capture is not None else None
+            hotkey.action(captured)
         except Exception:
-            log.exception("send failed")
-            self.notifier.show(self.notifier.t("failed"), error=True)
+            log.exception("%s failed", hotkey.name)
+            self.notifier.show(self.notifier.t(hotkey.failed), error=True)
 
     # -- main loop --
     def stop(self) -> None:
         self.running = False
 
     def run(self) -> None:
+        for hotkey in self.hotkeys:
+            log.info("%s hotkey: %s", hotkey.name,
+                     describe(hotkey.detector.combo, hotkey.detector.hold_seconds))
+        try:
+            self._loop()
+        finally:
+            if self.recorder is not None:
+                self.recorder.stop()
+
+    def _loop(self) -> None:
         ecodes = self.evdev.ecodes
-        log.info("hotkey: hold %s for %g seconds", self.combo.label, self.cfg.hold_seconds)
-        next_scan = 0.0
+        next_scan = next_sync = 0.0
         while self.running:
             now = time.monotonic()
             if now >= next_scan:
                 self.scan()
+                if self.recorder is not None:
+                    self.recorder.check(now)
                 next_scan = now + RESCAN_SECONDS
             wake = next_scan
-            if self.detector.deadline is not None:
-                wake = min(wake, self.detector.deadline)
+            if self.fetcher is not None:
+                if now >= next_sync:
+                    self.pool.submit(self.fetcher.sync)
+                    next_sync = now + SYNC_SECONDS
+                wake = min(wake, next_sync)
+            for hotkey in self.hotkeys:
+                if hotkey.detector.deadline is not None:
+                    wake = min(wake, hotkey.detector.deadline)
             by_fd = dict((dev.fd, path) for path, dev in self.devices.items())
             try:
                 ready, _, _ = select.select(list(by_fd), [], [], max(0.0, wake - time.monotonic()))
@@ -161,12 +224,14 @@ class Listener:
                     for ev in dev.read():
                         now = time.monotonic()
                         if ev.type == ecodes.EV_KEY:
-                            self._handle(self.detector.key_event(path, ev.code, ev.value, now))
+                            self._feed(lambda d: d.key_event(path, ev.code, ev.value, now))
                         elif ev.type == ecodes.EV_SYN and ev.code == ecodes.SYN_DROPPED:
                             # The kernel dropped events: resync the key state.
-                            self._handle(self.detector.sync_device(path, dev.active_keys(), now))
+                            active = dev.active_keys()
+                            self._feed(lambda d: d.sync_device(path, active, now))
                 except BlockingIOError:
                     pass
                 except OSError:
                     self._drop(path)
-            self._handle(self.detector.poll(time.monotonic()))
+            now = time.monotonic()
+            self._feed(lambda d: d.poll(now))

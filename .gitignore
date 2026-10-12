@@ -1,2 +1,4 @@
 config.ini
 __pycache__/
+# built by install.sh (glib-compile-schemas)
+gschemas.compiled

@@ -5,7 +5,7 @@ import configparser
 import os
 import stat
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from .hotkey import Combo, HotkeyError, parse_combo
 
@@ -38,6 +38,22 @@ def nautilus_state_path() -> str:
     return os.path.join(runtime_dir(), "nautilus.json")
 
 
+def state_dir() -> str:
+    """Kept across reboots: what hold2tg knows about the channel's messages."""
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    path = os.path.join(base, "hold2tg")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def received_dir() -> str:
+    """Where files fetched from the channel wait to be pasted."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    path = os.path.join(base, "hold2tg", "received")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
 @dataclass
 class Config:
     bot_token: str = ""
@@ -45,10 +61,20 @@ class Config:
     proxy: str = ""
     api_base: str = "https://api.telegram.org"
     silent: bool = False
-    hotkey: str = "ctrl+shift+s"
+    hotkey: str = "capslock+c"
     hold_seconds: float = 5.0
+    fetch_hotkey: str = "capslock+v"
+    fetch_hold_seconds: float = 5.0
+    translate_hotkey: str = "capslock+t"
+    translate_hold_seconds: float = 5.0
+    history_hotkey: str = "capslock+h"
+    history_hold_seconds: float = 0.0
+    history_size: int = 100
+    translate_language: str = "fa"
+    translate_second_language: str = "en"
+    translate_proxy: str = ""  # empty = the [telegram] proxy, "none" = direct
     notifications: bool = True
-    language: str = "fa"
+    language: str = "en"
     max_file_mb: float = 50.0
     max_files: int = 20
     zip_folders: bool = True
@@ -59,6 +85,27 @@ class Config:
     @property
     def combo(self) -> Combo:
         return parse_combo(self.hotkey)
+
+    @property
+    def fetch_combo(self) -> Optional[Combo]:
+        """The hotkey that copies the newest channel message; None = disabled."""
+        return parse_combo(self.fetch_hotkey) if self.fetch_hotkey else None
+
+    @property
+    def translate_combo(self) -> Optional[Combo]:
+        """The hotkey that opens the translation box; None = disabled."""
+        return parse_combo(self.translate_hotkey) if self.translate_hotkey else None
+
+    @property
+    def history_combo(self) -> Optional[Combo]:
+        """The hotkey that shows the clipboard history; None = the history is off."""
+        return parse_combo(self.history_hotkey) if self.history_hotkey else None
+
+    @property
+    def google_proxy(self) -> str:
+        if self.translate_proxy.lower() in ("none", "direct", "off"):
+            return ""
+        return self.translate_proxy or self.proxy
 
     def require_telegram(self) -> None:
         if not self.bot_token or not self.chat_id:
@@ -112,6 +159,20 @@ def load(path: str = "") -> Config:
 
     cfg.hotkey = get("hotkey", "keys", cfg.hotkey)
     cfg.hold_seconds = get_num("hotkey", "hold_seconds", cfg.hold_seconds)
+    cfg.fetch_hotkey = get("hotkey", "fetch_keys", cfg.fetch_hotkey)
+    cfg.fetch_hold_seconds = get_num("hotkey", "fetch_hold_seconds", cfg.fetch_hold_seconds)
+    cfg.translate_hotkey = get("hotkey", "translate_keys", cfg.translate_hotkey)
+    cfg.translate_hold_seconds = get_num("hotkey", "translate_hold_seconds",
+                                         cfg.translate_hold_seconds)
+
+    cfg.history_hotkey = get("hotkey", "history_keys", cfg.history_hotkey)
+    cfg.history_hold_seconds = get_num("hotkey", "history_hold_seconds", cfg.history_hold_seconds)
+    cfg.history_size = int(get_num("history", "size", cfg.history_size))
+
+    cfg.translate_language = get("translate", "language", cfg.translate_language)
+    cfg.translate_second_language = get("translate", "second_language",
+                                        cfg.translate_second_language)
+    cfg.translate_proxy = get("translate", "proxy", cfg.translate_proxy)
 
     cfg.notifications = get_bool("behavior", "notifications", cfg.notifications)
     cfg.language = get("behavior", "language", cfg.language).lower()
@@ -124,8 +185,28 @@ def load(path: str = "") -> Config:
         cfg.combo
     except HotkeyError as e:
         raise ConfigError("[hotkey] keys: %s" % e)
-    if cfg.hold_seconds < 0:
+    combos = {"keys": cfg.combo.groups}
+    for key, prop in (("fetch_keys", "fetch_combo"), ("translate_keys", "translate_combo"),
+                      ("history_keys", "history_combo")):
+        try:
+            combo = getattr(cfg, prop)
+        except HotkeyError as e:
+            raise ConfigError("[hotkey] %s: %s" % (key, e))
+        if combo is None:
+            continue
+        for other, groups in combos.items():
+            if set(combo.groups) == set(groups):
+                raise ConfigError("[hotkey] %s must differ from %s" % (key, other))
+        combos[key] = combo.groups
+    if min(cfg.hold_seconds, cfg.fetch_hold_seconds, cfg.translate_hold_seconds,
+           cfg.history_hold_seconds) < 0:
         raise ConfigError("[hotkey] hold_seconds cannot be negative")
+    if not cfg.translate_language or not cfg.translate_second_language:
+        raise ConfigError("[translate] language and second_language cannot be empty")
+    if cfg.translate_language == cfg.translate_second_language:
+        raise ConfigError("[translate] language and second_language must differ")
+    if not 1 <= cfg.history_size <= 1000:
+        raise ConfigError("[history] size must be between 1 and 1000")
     if cfg.text_backend not in ("auto", "xclip", "xsel", "wl-paste"):
         raise ConfigError("[behavior] text_backend must be auto, xclip, xsel or wl-paste")
     if cfg.language not in ("fa", "en"):

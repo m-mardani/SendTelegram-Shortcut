@@ -103,6 +103,39 @@ class ClientTests(unittest.TestCase):
         self.assertNotIn(TOKEN, str(cm.exception))
         self.assertIn("<token>", str(cm.exception))
 
+    def test_get_updates_confirms_only_when_given_an_offset(self):
+        self.client.get_updates()
+        self.client.get_updates(42)
+        self.assertNotIn("offset", self.fake.calls[0][1])
+        self.assertEqual(self.fake.calls[1][1]["offset"], "42")
+
+    def test_every_sent_message_is_reported_and_a_broken_hook_is_harmless(self):
+        seen = []
+        self.client.on_sent = seen.append
+        self.client.send_text("line\n" * 2500)
+        self.assertEqual(len(seen), 4)
+        self.client.on_sent = lambda message: 1 / 0
+        self.assertEqual(self.client.send_text("hi"), 1)
+
+    def test_download_writes_the_exact_bytes(self):
+        self.fake.methods["getFile"] = lambda f: {"file_path": "documents/file_1.pdf"}
+        self.fake.files["documents/file_1.pdf"] = data = os.urandom(700 * 1024)
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "x.pdf")
+            self.client.download("FID", dest)
+            with open(dest, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+            self.assertEqual(os.listdir(tmp), ["x.pdf"])
+        self.assertEqual(self.fake.calls[0][1]["file_id"], "FID")
+
+    def test_failed_download_leaves_nothing_behind(self):
+        self.fake.methods["getFile"] = lambda f: {"file_path": "gone"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(TelegramError) as cm:
+                self.client.download("FID", os.path.join(tmp, "x"))
+            self.assertEqual(os.listdir(tmp), [])
+        self.assertNotIn(TOKEN, str(cm.exception))
+
     def test_silent_flag(self):
         TelegramClient(TOKEN, "-1001", api_base=self.fake.base, silent=True).send_text("x")
         self.assertEqual(self.fake.calls[0][1]["disable_notification"], "true")

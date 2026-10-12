@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.hold2tg-clipboard"
+          path="/org/gnome/shell/extensions/hold2tg-clipboard/">
+    <key name="toggle-history" type="as">
+      <default><![CDATA[['<Super><Alt>h']]]></default>
+      <summary>Shortcut that shows the clipboard history</summary>
+    </key>
+    <key name="catch-keys" type="as">
+      <default>[]</default>
+      <summary>hold2tg's hotkeys to keep from the apps, e.g. &lt;Mod3&gt;c for Caps Lock+C (set by hold2tg)</summary>
+    </key>
+    <key name="history-size" type="i">
+      <range min="10" max="500"/>
+      <default>100</default>
+      <summary>How many copies to keep (pinned ones are kept besides)</summary>
+    </key>
+    <key name="record" type="b">
+      <default>true</default>
+      <summary>Record copies at all (hold2tg turns it off when its history_keys is empty)</summary>
+    </key>
+    <key name="paste-on-select" type="b">
+      <default>true</default>
+      <summary>Paste the chosen item into the window, as on Windows (false: only copy it)</summary>
+    </key>
+    <key name="language" type="s">
+      <choices>
+        <choice value="auto"/>
+        <choice value="en"/>
+        <choice value="fa"/>
+      </choices>
+      <default>'auto'</default>
+      <summary>Language of the panel: auto follows hold2tg's language setting</summary>
+    </key>
+  </schema>
+</schemalist>
